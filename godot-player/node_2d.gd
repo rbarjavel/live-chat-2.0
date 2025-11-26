@@ -271,6 +271,9 @@ func play_image(image_path: String, caption_text: String, sender_name: String, a
 			texture_rect.position.y + display_height + 10.0  # 10 pixels below image bottom
 		)
 
+		if caption_label.position.y > 600:
+			caption_label.position.y = 600
+
 		# Debug information
 		print("Image display size: ", display_width, "x", display_height)
 		print("Image position: ", texture_rect.position)
