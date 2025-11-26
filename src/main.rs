@@ -1,6 +1,7 @@
 mod client;
 mod compression;
 mod error;
+mod gui_client;
 mod media;
 mod media_cache;
 mod media_player;
@@ -57,7 +58,7 @@ async fn main() -> Result<()> {
             port,
             username,
         } => {
-            client::run_client(&host, port, username).await?;
+            gui_client::run_gui_client(&host, port, username)?;
         }
     }
 
