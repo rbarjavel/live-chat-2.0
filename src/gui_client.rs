@@ -15,16 +15,33 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 /// Commands sent from GUI thread to network thread
 #[derive(Debug)]
 enum ClientCommand {
-    SendText(String),
-    SendFile(PathBuf),
-    SendMedia {
+    Text(String),
+    File(PathBuf),
+    Media {
         path: PathBuf,
         caption: Option<String>,
     },
-    SendUrl {
+    Url {
         url: String,
         caption: Option<String>,
     },
+}
+
+/// Log levels for debug logging
+#[derive(Debug, Clone)]
+enum LogLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+/// Log entry for debug window
+#[derive(Debug, Clone)]
+struct LogEntry {
+    timestamp: String,
+    level: LogLevel,
+    message: String,
 }
 
 /// Events sent from network thread to GUI thread
@@ -34,6 +51,7 @@ enum NetworkEvent {
     Disconnected,
     MessageReceived(DisplayMessage),
     ConnectionError(String),
+    LogMessage(LogEntry),
 }
 
 /// GUI-friendly message representation
@@ -53,6 +71,9 @@ enum MessageContent {
     },
     UserJoined,
     UserLeft,
+    UserList {
+        usernames: Vec<String>,
+    },
     SystemInfo(String),
     DownloadProgress {
         percent: f32,
@@ -77,6 +98,14 @@ struct PendingMedia {
     cached_path: PathBuf,
 }
 
+/// Dialog state for file operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialogState {
+    None,
+    Caption,
+    Url,
+}
+
 /// Main GUI application state
 struct ChatApp {
     // Network communication
@@ -89,13 +118,17 @@ struct ChatApp {
     username: String,
     connected: bool,
 
-    // File operations
-    show_caption_dialog: bool,
+    // User tracking
+    connected_users: std::collections::HashSet<String>,
+
+    // Debug logging
+    show_log_window: bool,
+    log_messages: Vec<LogEntry>,
+
+    // File operations and dialogs
+    dialog_state: DialogState,
     pending_file: Option<PathBuf>,
     caption_input: String,
-
-    // URL dialog
-    show_url_dialog: bool,
     url_input: String,
     url_caption_input: String,
 }
@@ -114,10 +147,12 @@ impl ChatApp {
             input_text: String::new(),
             username,
             connected: false,
-            show_caption_dialog: false,
+            connected_users: std::collections::HashSet::new(),
+            show_log_window: false,
+            log_messages: Vec::new(),
+            dialog_state: DialogState::None,
             pending_file: None,
             caption_input: String::new(),
-            show_url_dialog: false,
             url_input: String::new(),
             url_caption_input: String::new(),
         }
@@ -127,13 +162,34 @@ impl ChatApp {
         match event {
             NetworkEvent::Connected => {
                 self.connected = true;
+                self.connected_users.clear();
+                self.connected_users.insert(self.username.clone());
                 self.add_system_message("Connected to server");
             }
             NetworkEvent::Disconnected => {
                 self.connected = false;
+                self.connected_users.clear();
                 self.add_system_message("Disconnected from server");
             }
             NetworkEvent::MessageReceived(msg) => {
+                // Track user joins/leaves/list
+                match &msg.content {
+                    MessageContent::UserList { usernames } => {
+                        // Populate initial user list
+                        self.connected_users.clear();
+                        for username in usernames {
+                            self.connected_users.insert(username.clone());
+                        }
+                    }
+                    MessageContent::UserJoined => {
+                        self.connected_users.insert(msg.sender.clone());
+                    }
+                    MessageContent::UserLeft => {
+                        self.connected_users.remove(&msg.sender);
+                    }
+                    _ => {}
+                }
+
                 // Special handling for progress/status messages - update existing instead of adding new
                 match &msg.content {
                     MessageContent::DownloadProgress { .. } => {
@@ -165,6 +221,13 @@ impl ChatApp {
             NetworkEvent::ConnectionError(err) => {
                 self.add_system_message(&format!("Connection error: {err}"));
             }
+            NetworkEvent::LogMessage(entry) => {
+                self.log_messages.push(entry);
+                // Keep last 1000 entries
+                if self.log_messages.len() > 1000 {
+                    self.log_messages.remove(0);
+                }
+            }
         }
     }
 
@@ -179,7 +242,7 @@ impl ChatApp {
     fn send_text(&mut self) {
         if !self.input_text.is_empty() {
             let text = std::mem::take(&mut self.input_text);
-            let _ = self.command_tx.send(ClientCommand::SendText(text));
+            let _ = self.command_tx.send(ClientCommand::Text(text));
         }
     }
 
@@ -190,13 +253,13 @@ impl ChatApp {
             .pick_file()
         {
             self.pending_file = Some(path);
-            self.show_caption_dialog = true;
+            self.dialog_state = DialogState::Caption;
         }
     }
 
     fn open_file_picker_regular(&self) {
         if let Some(path) = rfd::FileDialog::new().pick_file() {
-            let _ = self.command_tx.send(ClientCommand::SendFile(path));
+            let _ = self.command_tx.send(ClientCommand::File(path));
         }
     }
 
@@ -208,10 +271,10 @@ impl ChatApp {
                 .unwrap_or("unknown"),
         ) {
             self.pending_file = Some(path);
-            self.show_caption_dialog = true;
+            self.dialog_state = DialogState::Caption;
         } else {
             // Send as regular file
-            let _ = self.command_tx.send(ClientCommand::SendFile(path));
+            let _ = self.command_tx.send(ClientCommand::File(path));
         }
     }
 
@@ -226,6 +289,7 @@ impl ChatApp {
             });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_message(&self, ui: &mut egui::Ui, msg: &DisplayMessage) {
         let is_own = msg.sender == self.username;
 
@@ -276,6 +340,18 @@ impl ChatApp {
                     ui.label(egui::RichText::new(&msg.timestamp).weak().small());
                     ui.label(
                         egui::RichText::new(format!("*** {} left ***", msg.sender))
+                            .weak()
+                            .italics(),
+                    );
+                });
+            }
+
+            MessageContent::UserList { usernames } => {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&msg.timestamp).weak().small());
+                    let user_list = usernames.join(", ");
+                    ui.label(
+                        egui::RichText::new(format!("📋 Connected users: {user_list}"))
                             .weak()
                             .italics(),
                     );
@@ -339,49 +415,8 @@ impl ChatApp {
         ui.add_space(4.0);
     }
 
-    fn render_input(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            // Text input
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.input_text)
-                    .hint_text("Type a message...")
-                    .desired_width(ui.available_width() - 280.0),
-            );
-
-            // Send on Enter
-            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.send_text();
-                response.request_focus();
-            }
-
-            // Send button
-            if ui.button("Send").clicked() {
-                self.send_text();
-            }
-
-            // File button
-            if ui.button("📎 File").clicked() {
-                self.open_file_picker_regular();
-            }
-
-            // Media upload button
-            if ui.button("🖼 Media").clicked() {
-                self.open_file_picker_media();
-            }
-
-            // URL download button
-            if ui.button("🔗 URL").clicked() {
-                self.show_url_dialog = true;
-            }
-        });
-    }
-
     fn render_caption_dialog(&mut self, ctx: &egui::Context) {
-        if self.show_caption_dialog {
+        if self.dialog_state == DialogState::Caption {
             egui::Window::new("Add Caption")
                 .collapsible(false)
                 .resizable(false)
@@ -401,15 +436,15 @@ impl ChatApp {
                                 };
                                 let _ = self
                                     .command_tx
-                                    .send(ClientCommand::SendMedia { path, caption });
+                                    .send(ClientCommand::Media { path, caption });
                             }
-                            self.show_caption_dialog = false;
+                            self.dialog_state = DialogState::None;
                         }
 
                         if ui.button("Cancel").clicked() {
                             self.pending_file = None;
                             self.caption_input.clear();
-                            self.show_caption_dialog = false;
+                            self.dialog_state = DialogState::None;
                         }
                     });
                 });
@@ -417,7 +452,7 @@ impl ChatApp {
     }
 
     fn render_url_dialog(&mut self, ctx: &egui::Context) {
-        if self.show_url_dialog {
+        if self.dialog_state == DialogState::Url {
             egui::Window::new("Download from URL")
                 .collapsible(false)
                 .resizable(false)
@@ -440,19 +475,137 @@ impl ChatApp {
                                 } else {
                                     Some(std::mem::take(&mut self.url_caption_input))
                                 };
-                                let _ = self.command_tx.send(ClientCommand::SendUrl { url, caption });
+                                let _ = self.command_tx.send(ClientCommand::Url { url, caption });
                             }
-                            self.show_url_dialog = false;
+                            self.dialog_state = DialogState::None;
                         }
 
                         if ui.button("Cancel").clicked() {
                             self.url_input.clear();
                             self.url_caption_input.clear();
-                            self.show_url_dialog = false;
+                            self.dialog_state = DialogState::None;
                         }
                     });
                 });
         }
+    }
+
+    fn render_log_window(&mut self, ctx: &egui::Context) {
+        if self.show_log_window {
+            egui::Window::new("Debug Log")
+                .default_size([600.0, 400.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Clear").clicked() {
+                            self.log_messages.clear();
+                        }
+                        ui.label(format!("{} entries", self.log_messages.len()));
+                    });
+                    ui.separator();
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for entry in &self.log_messages {
+                                ui.horizontal(|ui| {
+                                    let (icon, color) = match entry.level {
+                                        LogLevel::Info => ("ℹ️", egui::Color32::GRAY),
+                                        LogLevel::Success => ("✅", egui::Color32::GREEN),
+                                        LogLevel::Warning => ("⚠️", egui::Color32::YELLOW),
+                                        LogLevel::Error => ("❌", egui::Color32::RED),
+                                    };
+                                    ui.label(icon);
+                                    ui.label(
+                                        egui::RichText::new(&entry.timestamp).weak().small(),
+                                    );
+                                    ui.label(egui::RichText::new(&entry.message).color(color));
+                                });
+                            }
+                        });
+                });
+        }
+    }
+
+    fn render_users_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("👥 Users");
+
+        let count = self.connected_users.len();
+        ui.label(format!("Online: {count}"));
+        ui.separator();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                let mut users: Vec<_> = self.connected_users.iter().collect();
+                users.sort();
+
+                for user in users {
+                    let is_self = user == &self.username;
+                    let text = if is_self {
+                        egui::RichText::new(format!("• {user} (you)"))
+                            .color(egui::Color32::LIGHT_BLUE)
+                    } else {
+                        egui::RichText::new(format!("• {user}"))
+                    };
+                    ui.label(text);
+                }
+            });
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.add_space(8.0);
+            if ui.button("📋 Log").clicked() {
+                self.show_log_window = !self.show_log_window;
+            }
+        });
+    }
+
+    fn render_actions_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Actions");
+        ui.separator();
+
+        // Media Upload Section
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("🖼️ Media Upload").strong());
+            ui.add_space(5.0);
+
+            if ui.button("📂 Select File").clicked() {
+                self.open_file_picker_media();
+            }
+
+            ui.add_space(3.0);
+            ui.label(egui::RichText::new("Drag & drop files here").weak().small());
+        });
+
+        ui.add_space(10.0);
+
+        // URL Download Section
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("🔗 URL Download").strong());
+            ui.add_space(5.0);
+
+            if ui.button("🌐 Download from URL").clicked() {
+                self.dialog_state = DialogState::Url;
+            }
+
+            ui.add_space(3.0);
+            ui.label(egui::RichText::new("YouTube, Twitter, etc.").weak().small());
+        });
+
+        ui.add_space(10.0);
+
+        // File Transfer Section
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("📎 File Transfer").strong());
+            ui.add_space(5.0);
+
+            if ui.button("📄 Send File").clicked() {
+                self.open_file_picker_regular();
+            }
+
+            ui.add_space(3.0);
+            ui.label(egui::RichText::new("Any file type").weak().small());
+        });
     }
 }
 
@@ -472,33 +625,86 @@ impl eframe::App for ChatApp {
             }
         });
 
-        // Main panel
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(format!("Image Chat - {}", self.username));
-            ui.label(if self.connected {
-                "🟢 Connected"
-            } else {
-                "🔴 Disconnected"
+        // Top bar
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(format!("Image Chat - {}", self.username));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(if self.connected {
+                        "🟢 Connected"
+                    } else {
+                        "🔴 Disconnected"
+                    });
+                });
             });
-            ui.separator();
+        });
 
-            // Chat area (takes most of the space)
-            let available_height = ui.available_height() - 80.0;
+        // Left sidebar - Users
+        egui::SidePanel::left("users_panel")
+            .default_width(150.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                self.render_users_panel(ui);
+            });
+
+        // Right sidebar - Actions
+        egui::SidePanel::right("actions_panel")
+            .default_width(200.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                self.render_actions_panel(ui);
+            });
+
+        // Center - Chat
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Chat area
+            let available_height = ui.available_height() - 50.0;
             ui.allocate_ui(egui::vec2(ui.available_width(), available_height), |ui| {
                 self.render_chat(ui);
             });
 
-            // Input area (fixed at bottom)
-            self.render_input(ui);
+            ui.separator();
+
+            // Input area (simplified - just text + send)
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.input_text)
+                        .hint_text("Type a message...")
+                        .desired_width(ui.available_width() - 70.0),
+                );
+
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.send_text();
+                    response.request_focus();
+                }
+
+                if ui.button("Send").clicked() {
+                    self.send_text();
+                }
+            });
         });
 
         // Render dialogs
         self.render_caption_dialog(ctx);
         self.render_url_dialog(ctx);
+        self.render_log_window(ctx);
 
         // Request continuous repaint for animations and event processing
         ctx.request_repaint();
     }
+}
+
+/// Macro for logging to GUI log window
+macro_rules! gui_log {
+    ($tx:expr, $level:expr, $($arg:tt)*) => {{
+        eprintln!($($arg)*);  // Still print to stderr
+        let entry = LogEntry {
+            timestamp: format_timestamp(),
+            level: $level,
+            message: format!($($arg)*),
+        };
+        let _ = $tx.send(NetworkEvent::LogMessage(entry));
+    }};
 }
 
 /// Entry point for GUI client
@@ -593,10 +799,10 @@ async fn network_task(
 
     // Try to use Godot player, fall back to system viewer if not found
     let media_player: Arc<dyn MediaPlayer> = if let Some(godot) = GodotMediaPlayer::find_player() {
-        eprintln!("✅ Found Godot player at: {}", godot.player_path.display());
+        gui_log!(event_tx, LogLevel::Success, "✅ Found Godot player at: {}", godot.player_path.display());
         Arc::new(godot)
     } else {
-        eprintln!("⚠️  Godot player not found, using system default viewer");
+        gui_log!(event_tx, LogLevel::Warning, "⚠️  Godot player not found, using system default viewer");
         Arc::new(SystemViewerPlayer)
     };
 
@@ -609,6 +815,7 @@ async fn network_task(
 
     // Spawn receiver task
     let event_tx_clone = event_tx.clone();
+    let event_tx_for_logs = event_tx.clone();
     let username_clone = username.clone();
     let media_cache_clone = Arc::clone(&media_cache);
     let media_player_clone = Arc::clone(&media_player);
@@ -618,6 +825,7 @@ async fn network_task(
     tokio::spawn(receive_task(
         read_half,
         event_tx_clone,
+        event_tx_for_logs,
         username_clone,
         media_cache_clone,
         media_player_clone,
@@ -658,9 +866,11 @@ async fn network_task(
 
 /// Task that receives messages from server
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn receive_task(
     mut read_half: OwnedReadHalf,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
+    event_tx_for_logs: mpsc::UnboundedSender<NetworkEvent>,
     username: String,
     media_cache: Arc<TokioMutex<MediaCache>>,
     media_player: Arc<dyn MediaPlayer>,
@@ -676,6 +886,7 @@ async fn receive_task(
                 &media_player,
                 &pending_media,
                 &ready_tx,
+                &event_tx_for_logs,
             )
             .await;
 
@@ -698,6 +909,7 @@ async fn convert_message(
     media_player: &Arc<dyn MediaPlayer>,
     pending_media: &Arc<TokioMutex<HashMap<String, PendingMedia>>>,
     ready_tx: &mpsc::UnboundedSender<Message>,
+    event_tx: &mpsc::UnboundedSender<NetworkEvent>,
 ) -> Option<DisplayMessage> {
     match message {
         Message::TextMessage {
@@ -754,14 +966,14 @@ async fn convert_message(
             .await
             {
                 Ok(()) => {
-                    eprintln!("📥 Media cached successfully: {} ({})", filename, &checksum[..8]);
+                    gui_log!(event_tx, LogLevel::Success, "📥 Media cached successfully: {} ({})", filename, &checksum[..8]);
 
                     // Send MediaReady acknowledgment
                     let ready_msg = Message::MediaReady {
                         media_id: checksum.clone(),
                         username: username.to_string(),
                     };
-                    eprintln!("✅ Sending MediaReady for media_id: {}", &checksum[..8]);
+                    gui_log!(event_tx, LogLevel::Success, "✅ Sending MediaReady for media_id: {}", &checksum[..8]);
                     let _ = ready_tx.send(ready_msg);
 
                     Some(DisplayMessage {
@@ -798,6 +1010,18 @@ async fn convert_message(
             sender: user.clone(),
             content: MessageContent::UserLeft,
         }),
+
+        Message::UserList { usernames } => {
+            gui_log!(event_tx, LogLevel::Info, "📋 Received user list: {} users", usernames.len());
+
+            Some(DisplayMessage {
+                timestamp: format_timestamp(),
+                sender: "System".to_string(),
+                content: MessageContent::UserList {
+                    usernames: usernames.clone(),
+                },
+            })
+        }
 
         Message::ServerInfo { message: msg } => Some(DisplayMessage {
             timestamp: format_timestamp(),
@@ -858,7 +1082,7 @@ async fn convert_message(
             media_id,
             countdown: _,
         } => {
-            eprintln!("🎬 Received PlaybackStart for media_id: {}", &media_id[..8]);
+            gui_log!(event_tx, LogLevel::Info, "🎬 Received PlaybackStart for media_id: {}", &media_id[..8]);
             let pending = pending_media.lock().await;
 
             if let Some(media) = pending.get(media_id) {
@@ -868,15 +1092,16 @@ async fn convert_message(
                 let caption = media.caption.clone();
                 let sender = media.sender.clone();
 
-                eprintln!("   Found pending media: {}", filename);
-                eprintln!("   Cached path: {}", cached_path.display());
-                eprintln!("   Media type: {:?}", media_type);
+                gui_log!(event_tx, LogLevel::Info, "   Found pending media: {}", filename);
+                gui_log!(event_tx, LogLevel::Info, "   Cached path: {}", cached_path.display());
+                gui_log!(event_tx, LogLevel::Info, "   Media type: {:?}", media_type);
 
                 drop(pending);
 
                 // Play media in a separate blocking task to avoid blocking the receiver
-                eprintln!("   Attempting to play media...");
+                gui_log!(event_tx, LogLevel::Info, "   Attempting to play media...");
                 let player = Arc::clone(media_player);
+                let event_tx_clone = event_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     if let Err(e) = player.play_media(
                         &cached_path,
@@ -884,9 +1109,9 @@ async fn convert_message(
                         caption.as_deref(),
                         Some(&sender),
                     ) {
-                        eprintln!("❌ Error playing media: {e}");
+                        gui_log!(event_tx_clone, LogLevel::Error, "❌ Error playing media: {e}");
                     } else {
-                        eprintln!("✅ Media player launched successfully");
+                        gui_log!(event_tx_clone, LogLevel::Success, "✅ Media player launched successfully");
                     }
                 });
 
@@ -902,7 +1127,7 @@ async fn convert_message(
                     content: MessageContent::SyncStart { filename },
                 })
             } else {
-                eprintln!("⚠️  PlaybackStart received but no pending media found for media_id: {}", &media_id[..8]);
+                gui_log!(event_tx, LogLevel::Warning, "⚠️  PlaybackStart received but no pending media found for media_id: {}", &media_id[..8]);
                 None
             }
         }
@@ -923,7 +1148,7 @@ async fn handle_command(
     event_tx: &mpsc::UnboundedSender<NetworkEvent>,
 ) -> Result<()> {
     match command {
-        ClientCommand::SendText(text) => {
+        ClientCommand::Text(text) => {
             let msg = Message::TextMessage {
                 sender: username.to_string(),
                 content: text,
@@ -939,7 +1164,7 @@ async fn handle_command(
             }
         }
 
-        ClientCommand::SendFile(path) => {
+        ClientCommand::File(path) => {
             let filename = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -963,7 +1188,7 @@ async fn handle_command(
             }
         }
 
-        ClientCommand::SendMedia { path, caption } => {
+        ClientCommand::Media { path, caption } => {
             let filename = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1013,7 +1238,7 @@ async fn handle_command(
             }));
         }
 
-        ClientCommand::SendUrl { url, caption } => {
+        ClientCommand::Url { url, caption } => {
             let msg = Message::UrlDownloadRequest {
                 requester: username.to_string(),
                 url,

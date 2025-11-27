@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::compression;
 use crate::error::{ChatError, Result};
 use crate::media::{calculate_sha256, detect_media_type, MediaType};
@@ -490,6 +492,9 @@ fn display_message(
         } => {
             eprintln!("\n❌ Download failed for {url}");
             eprintln!("   Error: {error}");
+        }
+        Message::UserList { usernames } => {
+            println!("\n📋 Connected users: {}", usernames.join(", "));
         }
     }
 }

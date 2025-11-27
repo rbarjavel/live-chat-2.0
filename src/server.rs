@@ -148,9 +148,19 @@ async fn handle_client(mut stream: TcpStream, state: Arc<Mutex<ServerState>>) ->
     // Register client
     let client_id = {
         let mut state = state.lock().await;
-        let id = state.add_client(username.clone(), tx);
+        let id = state.add_client(username.clone(), tx.clone());
 
-        // Broadcast join notification to all clients
+        // Send current user list to the new client
+        let usernames: Vec<String> = state
+            .clients
+            .values()
+            .map(|client| client.username.clone())
+            .collect();
+
+        let user_list_msg = Message::UserList { usernames };
+        let _ = tx.send(user_list_msg);
+
+        // Broadcast join notification to all OTHER clients
         state.broadcast(
             &Message::UserJoined {
                 username: username.clone(),
@@ -263,9 +273,9 @@ async fn handle_client(mut stream: TcpStream, state: Arc<Mutex<ServerState>>) ->
                 let state_clone = Arc::clone(&state);
                 handle_media_ready(state_clone, client_id, media_id.clone()).await;
             } else {
-                // Broadcast to all other clients
+                // Broadcast to all clients (including sender for text messages)
                 let state = state.lock().await;
-                state.broadcast(&message, Some(client_id));
+                state.broadcast(&message, None);
             }
         }
     }

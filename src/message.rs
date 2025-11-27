@@ -34,6 +34,10 @@ pub enum Message {
     UserLeft {
         username: String,
     },
+    /// Server sends list of connected users (sent to new clients on connection)
+    UserList {
+        usernames: Vec<String>,
+    },
     ServerInfo {
         message: String,
     },
